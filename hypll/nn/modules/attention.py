@@ -1,5 +1,6 @@
-from typing import Optional
+from typing import List, Optional, Union, Tuple
 
+import torch
 from torch.nn import Module
 
 from hypll.manifolds import Manifold
@@ -23,7 +24,7 @@ class HMultiheadAttention(Module):
         self.manifold = manifold
         self.kdim = kdim if kdim is not None else embed_dim
         self.vdim = vdim if vdim is not None else embed_dim
-        self.batch_first = batch_first # TODO: need to fix this by swapping around input dims
+        self.batch_first = batch_first
 
         self.head_dim = embed_dim // num_heads
         assert (
@@ -49,10 +50,15 @@ class HMultiheadAttention(Module):
 
     def forward(
         self,
-        query: ManifoldTensor, # [B, L_t, D]
-        key: ManifoldTensor, # [B, L_s, D]
-        value: ManifoldTensor, # [B, L_s, D]
-    ) -> ManifoldTensor:
+        query: ManifoldTensor, # [B, L_t, D] if batch_first
+        key: ManifoldTensor, # [B, L_s, D] if batch_first
+        value: ManifoldTensor, # [B, L_s, D] if batch_first
+        return_weights: bool = False
+    ) -> Union[ManifoldTensor, Tuple[ManifoldTensor, List[torch.Tensor]]]:
+        # Handle non-batch-first input
+        if not self.batch_first:
+            query, key, value = query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1)
+
         # Project Q, K and V with FC-layers ([B, L_s, D] -> [B, L_s, hd], with hd = D, so not really a projection)
         proj_q = self.q_map(query)
         proj_k = self.k_map(key)
@@ -78,4 +84,13 @@ class HMultiheadAttention(Module):
         ]
 
         # Concatenate outputs
-        return self.manifold.cat(aggregates, dim=-1)
+        result = self.manifold.cat(aggregates, dim=-1)
+
+        # Handle non-batch-first output
+        if not self.batch_first:
+            result = result.transpose(0, 1)
+
+        if return_weights:
+            return result, weights
+        else:
+            return result
