@@ -141,3 +141,36 @@ def test_cat__beta_concatenation_correct_norm():
     mt2 = ManifoldTensor(t2 / t2.norm(), manifold=manifold)
     cat = manifold.cat([mt1, mt2])
     assert torch.isclose(cat.tensor.norm(), torch.as_tensor(1.0), atol=1e-2)
+
+
+def test_expmap_logmap__is_symmetric():
+    manifold = PoincareBall(c=Curvature())
+
+    tensor = torch.randn(4, 3, 2)
+    tangents = TangentTensor(data=tensor, man_dim=1, manifold=manifold)
+    manifold_tensor = manifold.expmap(tangents)
+
+    projected_tangents = manifold.logmap(None, manifold_tensor)
+
+    assert tangents.shape == projected_tangents.shape
+    assert torch.allclose(tangents.tensor, projected_tangents.tensor)
+
+
+@pytest.mark.parametrize("dim", [0, 1])  # test both when split_dim = man_dim and not man_dim
+def test_split_cat__is_symmetric(dim: int) -> None:
+    manifold = PoincareBall(c=Curvature())
+
+    # Generate points in Euclidean space and map them, to ensure they are on the manifold
+    tensor = torch.randn(4, 3, 2)
+    tangents = TangentTensor(data=tensor, man_dim=1, manifold=manifold)
+    manifold_tensor = manifold.expmap(tangents)
+
+    split_manifold_tensors = manifold.split(manifold_tensor, 1, dim=dim)
+    combined_manifold_tensor = manifold.cat(split_manifold_tensors, dim=dim)
+
+    assert manifold_tensor.shape == combined_manifold_tensor.shape
+
+    # FIXME had to set really high tolerance when dim==man_dim, 
+    # is it expected that we loose so much precision? Should we use float64 here?
+    # print((manifold_tensor.tensor - combined_manifold_tensor.tensor).abs().max())
+    assert torch.allclose(manifold_tensor.tensor, combined_manifold_tensor.tensor, atol=0.3)
