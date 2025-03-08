@@ -72,9 +72,9 @@ class HMultiheadAttention(Module):
             self.manifold.attention_activation(s) for s in similarities
         ]
 
-        # Aggregate values with some centroid
+        # Aggregate values with sequence-aware specialization of the centroid
         aggregates = [
-            self.manifold.midpoint(x=v, batch_dim=1, w=w) for v, w in zip(split_v, weights)
+            self.manifold.attention_midpoint(x=v, w=w) for v, w in zip(split_v, weights)
         ]
 
         # Concatenate outputs
