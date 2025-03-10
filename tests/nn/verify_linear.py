@@ -38,7 +38,8 @@ print(hypll_euc_linear_out.tensor)
 
 torch_linear_out = torch.nn.functional.linear(
     input=inp, 
-    weight=hypll_euc_linear.z.tensor, 
+    # Torch stores weights transposed
+    weight=hypll_euc_linear.z.tensor.T, 
     bias=hypll_euc_linear.bias
 ).detach()
 print(torch_linear_out.shape)
