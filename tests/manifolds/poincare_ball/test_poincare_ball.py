@@ -1,7 +1,8 @@
+import pytest
 import torch
 
 from hypll.manifolds.poincare_ball import Curvature, PoincareBall
-from hypll.tensors import ManifoldTensor
+from hypll.tensors import ManifoldTensor, TangentTensor
 
 
 def test_flatten__man_dim_equals_start_dim() -> None:
@@ -88,6 +89,31 @@ def test_flatten__man_dim_larger_end_dim() -> None:
     assert flattened.man_dim == 1
 
 
+def test_dist__commutative_with_zero_vector():
+    # Test some basic properties, laid out in e.g. https://geoopt.readthedocs.io/en/latest/extended/stereographic.html
+    manifold = PoincareBall(c=Curvature())
+    # generate manifold tensor just to get some random points
+    mt = ManifoldTensor(torch.randn(2, 8), manifold=manifold)
+    x = mt[0]
+    y = mt[1]
+
+    # commutativity holds only if one argument is a zero vector
+    zero_x = ManifoldTensor(torch.zeros_like(x.tensor), manifold=manifold)
+    assert torch.allclose(manifold.mobius_add(zero_x, x).tensor, manifold.mobius_add(x, zero_x).tensor)
+
+
+def test_dist__left_cancellation():
+    # Test some basic properties, laid out in e.g. https://geoopt.readthedocs.io/en/latest/extended/stereographic.html
+    manifold = PoincareBall(c=Curvature())
+    # generate manifold tensor just to get some random points
+    mt = ManifoldTensor(torch.randn(2, 8) / 10, manifold=manifold)
+    x = mt[0]
+    y = mt[1]
+
+    neg_x = ManifoldTensor(-x.tensor, manifold=manifold)
+    assert torch.allclose(manifold.mobius_add(neg_x, manifold.mobius_add(x, y)).tensor, y.tensor)
+
+
 def test_cdist__correct_dist():
     B, P, R, M = 2, 3, 4, 8
     manifold = PoincareBall(c=Curvature())
@@ -142,18 +168,18 @@ def test_cat__beta_concatenation_correct_norm():
     cat = manifold.cat([mt1, mt2])
     assert torch.isclose(cat.tensor.norm(), torch.as_tensor(1.0), atol=1e-2)
 
-
+# FIXME test these on all manifolds, not just Poincare
 def test_expmap_logmap__is_symmetric():
     manifold = PoincareBall(c=Curvature())
 
-    tensor = torch.randn(4, 3, 2)
+    tensor = torch.randn(4, 3, 2) / 10
     tangents = TangentTensor(data=tensor, man_dim=1, manifold=manifold)
     manifold_tensor = manifold.expmap(tangents)
 
     projected_tangents = manifold.logmap(None, manifold_tensor)
 
     assert tangents.shape == projected_tangents.shape
-    assert torch.allclose(tangents.tensor, projected_tangents.tensor)
+    assert torch.allclose(tangents.tensor, projected_tangents.tensor), f"Max absolute difference: {(tangents.tensor - projected_tangents.tensor).abs().max()}"
 
 
 @pytest.mark.parametrize("dim", [0, 1])  # test both when split_dim = man_dim and not man_dim
@@ -161,7 +187,7 @@ def test_split_cat__is_symmetric(dim: int) -> None:
     manifold = PoincareBall(c=Curvature())
 
     # Generate points in Euclidean space and map them, to ensure they are on the manifold
-    tensor = torch.randn(4, 3, 2)
+    tensor = torch.randn(4, 3, 2) / 10
     tangents = TangentTensor(data=tensor, man_dim=1, manifold=manifold)
     manifold_tensor = manifold.expmap(tangents)
 
@@ -169,8 +195,4 @@ def test_split_cat__is_symmetric(dim: int) -> None:
     combined_manifold_tensor = manifold.cat(split_manifold_tensors, dim=dim)
 
     assert manifold_tensor.shape == combined_manifold_tensor.shape
-
-    # FIXME had to set really high tolerance when dim==man_dim, 
-    # is it expected that we loose so much precision? Should we use float64 here?
-    # print((manifold_tensor.tensor - combined_manifold_tensor.tensor).abs().max())
-    assert torch.allclose(manifold_tensor.tensor, combined_manifold_tensor.tensor, atol=0.3)
+    assert torch.allclose(manifold_tensor.tensor, combined_manifold_tensor.tensor), f"Max absolute difference: {(manifold_tensor.tensor - combined_manifold_tensor.tensor).abs().max()}"
