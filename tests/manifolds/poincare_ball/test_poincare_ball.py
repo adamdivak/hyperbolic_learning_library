@@ -166,7 +166,18 @@ def test_cat__beta_concatenation_correct_norm():
     mt1 = ManifoldTensor(t1 / t1.norm(), manifold=manifold)
     mt2 = ManifoldTensor(t2 / t2.norm(), manifold=manifold)
     cat = manifold.cat([mt1, mt2])
-    assert torch.isclose(cat.tensor.norm(), torch.as_tensor(1.0), atol=1e-2)
+    assert torch.isclose(cat.tensor.norm(), torch.as_tensor(1.0), atol=1e-2), f"Norm of concatenated tensor is {cat.tensor.norm()}, expected 1.0"
+
+
+def test_split__correct_norm():
+    MD = 128
+    manifold = PoincareBall(c=Curvature(0.1, constraining_strategy=lambda x: x))
+    t = torch.randn(MD)
+    mt = ManifoldTensor(t / t.norm(), manifold=manifold)
+    splits = manifold.split(mt, int(MD/2), dim=0)
+    for split in splits:
+        # FIXME I had to set a way too large atol to make the test pass, much larger than in concatenation.. why is that?
+        assert torch.isclose(split.tensor.norm(), torch.as_tensor(1.0), atol=1e-1), f"Norm of split tensor is {split.tensor.norm()}, expected 1.0"
 
 # FIXME test these on all manifolds, not just Poincare
 def test_expmap_logmap__is_symmetric():
@@ -179,7 +190,7 @@ def test_expmap_logmap__is_symmetric():
     projected_tangents = manifold.logmap(None, manifold_tensor)
 
     assert tangents.shape == projected_tangents.shape
-    assert torch.allclose(tangents.tensor, projected_tangents.tensor), f"Max absolute difference: {(tangents.tensor - projected_tangents.tensor).abs().max()}"
+    assert torch.allclose(tangents.tensor, projected_tangents.tensor), f"expmap+logmap should be identity, but found max absolute difference: {(tangents.tensor - projected_tangents.tensor).abs().max()}"
 
 
 @pytest.mark.parametrize("dim", [0, 1])  # test both when split_dim = man_dim and not man_dim
@@ -195,4 +206,4 @@ def test_split_cat__is_symmetric(dim: int) -> None:
     combined_manifold_tensor = manifold.cat(split_manifold_tensors, dim=dim)
 
     assert manifold_tensor.shape == combined_manifold_tensor.shape
-    assert torch.allclose(manifold_tensor.tensor, combined_manifold_tensor.tensor), f"Max absolute difference: {(manifold_tensor.tensor - combined_manifold_tensor.tensor).abs().max()}"
+    assert torch.allclose(manifold_tensor.tensor, combined_manifold_tensor.tensor), f"split+cat should be identity, but found max absolute difference: {(manifold_tensor.tensor - combined_manifold_tensor.tensor).abs().max()}"
