@@ -1,11 +1,12 @@
 import functools
+import math
 from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, empty, eye, no_grad
 from torch.nn import Parameter
 from torch.nn.common_types import _size_2_t
-from torch.nn.functional import softplus, unfold
+from torch.nn.functional import softplus, unfold, softmax
 from torch.nn.init import normal_, zeros_
 
 from hypll.manifolds.base import Manifold
@@ -18,6 +19,8 @@ from hypll.utils.tensor_utils import (
     check_if_man_dims_match,
     check_tangent_tensor_positions,
 )
+
+from hypll.manifolds.poincare_ball.math.geooptplus_copied_math_funcs import mobius_scalar_mul
 
 from .math.diffgeom import (
     cdist,
@@ -216,9 +219,18 @@ class PoincareBall(Manifold):
         new_tensor = attention_midpoint(
             x=x.tensor, c=self.c(), w=w,
         )
-        return ManifoldTensor(
+        result = ManifoldTensor(
             data=new_tensor, manifold=self, man_dim=-1
         )
+        
+        # FIXME HNN++ does a scaling as well, but that's to balance shorter, padded sequences and longer, unpadded sequences
+        # if I understand correctly. Probably need to add that.
+        # s = w.size(1)  # Fixme check if this is the correct dim
+        # result = self.mobius_scalar_mul(torch.FloatTensor([math.sqrt(s)]).to(x.tensor), result)
+
+        # HNN++ does a projection as well, not clear how much difference these make
+        # result = self.project(result)
+        return result
 
     def frechet_variance(
         self,
@@ -428,6 +440,16 @@ class PoincareBall(Manifold):
         self, queries: ManifoldTensor, keys: ManifoldTensor, tau: float = 10.0, gamma: float = 1.0
     ) -> Tensor:
         return -tau * self.cdist(queries, keys) - gamma
-    
+
     def attention_activation(self, similarities: Tensor) -> Tensor:
         return similarities.exp()
+        # return softmax(similarities, dim=-1)  # other option from HNN++, not clear if it's better
+
+    def mobius_scalar_mul(self, r: torch.Tensor, x: ManifoldTensor, *, dim=-1) -> ManifoldTensor:
+        """ Added from HNN++, but uses geoopt functions under the hood
+        FIXME integrate properly if we keep on using it """
+        dim = check_dims_with_broadcasting(r, x)
+        # to the best of my understanding, c == k, but I wasn't entirely sure
+        new_tensor = mobius_scalar_mul(r=r, x=x.tensor, k=self.c(), dim=dim)
+        return ManifoldTensor(data=new_tensor, manifold=self, man_dim=dim)
+
