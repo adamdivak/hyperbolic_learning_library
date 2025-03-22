@@ -71,19 +71,24 @@ class HMultiheadAttention(Module):
         split_k = proj_k.split(split_size_or_sections=self.head_dim, dim=-1)
         split_v = proj_v.split(split_size_or_sections=self.head_dim, dim=-1)
 
-        assert not any([s.tensor.isnan().any() for s in split_q]), f"NaNs in projected Qs: {split_q}"
-        assert not any([s.tensor.isnan().any() for s in split_k]), f"NaNs in projected Ks: {split_k}"
-        assert not any([s.tensor.isnan().any() for s in split_v]), f"NaNs in projected Vs: {split_v}"
+        if any([s.tensor.isnan().any() for s in split_q]):
+            raise ValueError(f"NaNs in projected Qs: {split_q}")
+        if any([s.tensor.isnan().any() for s in split_k]):
+            raise ValueError(f"NaNs in projected Ks: {split_k}")
+        if any([s.tensor.isnan().any() for s in split_v]):
+            raise ValueError(f"NaNs in projected Vs: {split_v}")
 
         # Apply similarity function f and activation g to Qs and Ks to obtain weights (g(f(q, k)))
         similarities = [
             self.manifold.attention_similarity(queries=q, keys=k) for q, k in zip(split_q, split_k)
         ]
-        assert not any([s.isnan().any() for s in similarities]), f"NaNs in similarities: {similarities}"
+        if any([s.isnan().any() for s in similarities]):
+            raise ValueError(f"NaNs in similarities: {similarities}")
         weights = [
             self.manifold.attention_activation(s) for s in similarities
         ]
-        assert not any([w.isnan().any() for w in weights]), f"NaNs in weights: {weights}"
+        if any([w.isnan().any() for w in weights]):
+            raise ValueError(f"NaNs in weights: {weights}")
 
         # Aggregate values with sequence-aware specialization of the centroid
         aggregates = [
@@ -133,6 +138,10 @@ class HFullDimensionMultiHeadAttention(Module):
         self.use_separate_kv_per_head = use_separate_kv_per_head
         self.batch_first = batch_first
 
+        # Introduce a scaling factor to prevent gradients from becoming too small.
+        self.scale_tau = nn.Parameter(torch.zeros(1))
+        self.scale_gamma = nn.Parameter(torch.zeros(1))
+
         # Create separate projection layers for each head
         self.q_maps = nn.ModuleList([
             HLinear(embed_dim, embed_dim, manifold=manifold) 
@@ -170,7 +179,9 @@ class HFullDimensionMultiHeadAttention(Module):
             v_i = self.v_maps[i](value) if self.use_separate_kv_per_head else self.v_map(value)
             
             # Calculate attention (no splitting)
-            similarities = self.manifold.attention_similarity(q_i, k_i)
+            # The code of HNN++ has the following line for similarity calculation, which I tried to replicate:
+            # x = - self.ball.dist_matmul(x, encoder_out[0]) / self.scale.exp()
+            similarities = self.manifold.attention_similarity(queries=q_i, keys=k_i, tau=1/self.scale_tau.exp(), gamma=self.scale_gamma)
             weights = self.manifold.attention_activation(similarities)
             output_i = self.manifold.attention_midpoint(v_i, weights)
             
