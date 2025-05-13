@@ -157,6 +157,10 @@ class PoincareBall(Manifold):
         new_tensor = ManifoldTensor(data=new_tensor, manifold=self, man_dim=x.man_dim)
         return self.project(new_tensor)
 
+    def mlr(self, x: ManifoldTensor, z: ManifoldTensor, bias: Optional[Tensor]) -> ManifoldTensor:
+        new_tensor = self.hyperplane_dists(x=x, z=z, r=bias)
+        return ManifoldTensor(data=new_tensor, manifold=self, man_dim=x.man_dim)
+
     def frechet_mean(
         self,
         x: ManifoldTensor,
