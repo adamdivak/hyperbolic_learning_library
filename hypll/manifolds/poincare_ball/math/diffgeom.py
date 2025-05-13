@@ -155,14 +155,65 @@ def cdist(
     y: torch.Tensor,
     c: torch.Tensor,
 ) -> torch.Tensor:
-    return 2 / c.sqrt() * (c.sqrt() * mobius_add_batch(-x, y, c).norm(dim=-1)).atanh()
+    return cdist_mobius(x, y, c)
+    # return cdist_arccosh(x, y, c)
+
+def cdist_arccosh(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    c: torch.Tensor,
+) -> torch.Tensor:
+    # Handle batched inputs with shape [batch, num_points, dim]
+    # and compute pairwise distances between all points in x and y
+    # This is an alternative, equivalent implementation of cdist_mobius, which 
+    # is supposed to be more numerically stable
+    
+    # Expand dimensions for broadcasting
+    # x shape: [batch, n_x, dim] -> [batch, n_x, 1, dim]
+    # y shape: [batch, n_y, dim] -> [batch, 1, n_y, dim]
+    x_e = x.unsqueeze(2)
+    y_e = y.unsqueeze(1)
+    
+    # Compute squared difference: ||x - y||^2
+    diff_sq = (x_e - y_e).pow(2).sum(dim=-1)  # [batch, n_x, n_y]
+    
+    # Compute ||x||^2 and ||y||^2
+    x_norm_sq = x.pow(2).sum(dim=-1, keepdim=True)  # [batch, n_x, 1]
+    y_norm_sq = y.pow(2).sum(dim=-1, keepdim=True)  # [batch, n_y, 1]
+    
+    # Compute denominator: (1 - c||x||^2)(1 - c||y||^2)
+    denom = (1 - c * x_norm_sq) * (1 - c * y_norm_sq.transpose(1, 2))  # [batch, n_x, n_y]
+    
+    # Compute the full formula: 1 / sqrt(c) * arccosh(1 + 2*c*num/denom)
+    inner = 1 + 2 * c * diff_sq / denom.clamp_min(1e-15)
+    result = 1 / c.sqrt() * inner.arccosh()
+    assert not inner.isnan().any(), inner
+    assert not inner.isinf().any(), inner
+    assert not result.isnan().any(), result
+    assert not result.isinf().any(), result
+    return result
+
+
+def cdist_mobius(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    c: torch.Tensor,
+) -> torch.Tensor:
+    inner = c.sqrt() * mobius_add_batch(-x, y, c).norm(dim=-1)
+    eps = 1e-7 
+    inner_clamped = inner.clamp(min=-1.0 + eps, max=1.0 - eps)
+    inner_tanh = inner_clamped.atanh() # FIXME had to introduce clamping here to avoid nans
+    result = 2 / c.sqrt() * inner_tanh
+    assert not result.isnan().any(), result
+    assert not result.isinf().any(), result
+    return result
 
 
 def mobius_add_batch(
     x: torch.Tensor,
     y: torch.Tensor,
     c: torch.Tensor,
-):
+) -> torch.Tensor:
     xy = torch.einsum("bij,bkj->bik", (x, y))
     x2 = x.pow(2).sum(dim=-1, keepdim=True)
     y2 = y.pow(2).sum(dim=-1, keepdim=True)

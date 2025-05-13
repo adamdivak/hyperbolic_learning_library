@@ -23,7 +23,8 @@ from hypll.utils.tensor_utils import (
 from hypll.manifolds.poincare_ball.math.geooptplus_copied_math_funcs import mobius_scalar_mul
 
 from .math.diffgeom import (
-    cdist,
+    cdist_mobius,
+    cdist_arccosh,
     dist,
     euc_to_tangent,
     expmap,
@@ -52,7 +53,7 @@ class PoincareBall(Manifold):
 
     """
 
-    def __init__(self, c: Curvature):
+    def __init__(self, c: Curvature, cdist_type: str="mobius"):
         """Initializes an instance of PoincareBall manifold.
 
         Examples:
@@ -63,6 +64,7 @@ class PoincareBall(Manifold):
         """
         super(PoincareBall, self).__init__()
         self.c = c
+        self.cdist_type = cdist_type
 
     def mobius_add(self, x: ManifoldTensor, y: ManifoldTensor) -> ManifoldTensor:
         dim = check_dims_with_broadcasting(x, y)
@@ -361,7 +363,12 @@ class PoincareBall(Manifold):
             return ManifoldTensor(data=flattened, manifold=x.manifold, man_dim=man_dim)
 
     def cdist(self, x: ManifoldTensor, y: ManifoldTensor) -> Tensor:
-        return cdist(x=x.tensor, y=y.tensor, c=self.c())
+        if self.cdist_type == "mobius":
+            return cdist_mobius(x=x.tensor, y=y.tensor, c=self.c())
+        elif self.cdist_type == "arccosh":
+            return cdist_arccosh(x=x.tensor, y=y.tensor, c=self.c())
+        else:
+            raise ValueError(f"Unknown cdist type: {self.cdist_type}")
 
     def cat(
         self,

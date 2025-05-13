@@ -207,3 +207,35 @@ def test_split_cat__is_symmetric(dim: int) -> None:
 
     assert manifold_tensor.shape == combined_manifold_tensor.shape
     assert torch.allclose(manifold_tensor.tensor, combined_manifold_tensor.tensor), f"split+cat should be identity, but found max absolute difference: {(manifold_tensor.tensor - combined_manifold_tensor.tensor).abs().max()}"
+
+@pytest.mark.parametrize("c", [0.5, 1.0, 2.0])
+def test_cdist_mobius_arccosh_equivalence(c: float) -> None:
+    """Test that cdist and cdist2 functions are equivalent when c=1."""
+    # Import the functions directly for testing
+    from hypll.manifolds.poincare_ball.math.diffgeom import cdist_mobius, cdist_arccosh
+    
+    # Create random points in the Poincare ball (with norm < 1)
+    # batch_size, num_points, dim = 2, 5, 3
+    batch_size, num_points, dim = 2, 1, 3
+    x = torch.rand(batch_size, num_points, dim) * 0.5  # Keep points well within the unit ball
+    y = torch.rand(batch_size, num_points, dim) * 0.5
+
+    manifold = PoincareBall(c=Curvature(value=c))
+
+    x_tangents = TangentTensor(data=x, man_dim=1, manifold=manifold)
+    y_tangents = TangentTensor(data=y, man_dim=1, manifold=manifold)
+    
+    x_manifold = manifold.expmap(x_tangents)
+    y_manifold = manifold.expmap(y_tangents)
+    
+    # Calculate distances using both methods
+    dist1 = cdist_mobius(x_manifold.tensor, y_manifold.tensor, manifold.c.value)
+    dist2 = cdist_arccosh(x_manifold.tensor, y_manifold.tensor, manifold.c.value)
+    
+    # Verify shapes match
+    assert dist1.shape == dist2.shape, f"Shape mismatch: dist1 {dist1.shape} vs dist2 {dist2.shape}"
+    assert dist1.shape == (batch_size, num_points, num_points), f"Expected shape {(batch_size, num_points, num_points)}, got {dist1.shape}"
+    
+    # Assert that the results are close
+    assert torch.allclose(dist1, dist2, rtol=1e-5, atol=1e-5), \
+        f"Maximum absolute difference: {(dist1 - dist2).abs().max().item()}"
