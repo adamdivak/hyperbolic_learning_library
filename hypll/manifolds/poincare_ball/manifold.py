@@ -452,9 +452,13 @@ class PoincareBall(Manifold):
     ) -> Tensor:
         return -tau * self.cdist(queries, keys) - gamma
 
-    def attention_activation(self, similarities: Tensor) -> Tensor:
-        return similarities.exp()
-        # return softmax(similarities, dim=-1)  # other option from HNN++, not clear if it's better
+    def attention_activation(self, similarities: Tensor, activation: str = "exp") -> Tensor:
+        if activation == "exp":
+            return similarities.exp()  # results in really large values in param_grad_norm
+        elif activation == "softmax":
+            return softmax(similarities, dim=-1)  # other option from FHNN++, not clear if it's better
+        else:
+            raise ValueError(f"Unknown activation: {activation}")
 
     def mobius_scalar_mul(self, r: torch.Tensor, x: ManifoldTensor, *, dim=-1) -> ManifoldTensor:
         """ Added from HNN++, but uses geoopt functions under the hood

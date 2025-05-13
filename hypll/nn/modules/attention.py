@@ -8,6 +8,43 @@ from hypll.manifolds import Manifold
 from hypll.nn import HLinear
 from hypll.tensors import ManifoldTensor
 
+class IntermediateValueModule(nn.Module):
+    def __init__(self, name):
+        super().__init__()
+        self.name = name
+        # Register a buffer for the saved tensor (not a parameter since we don't want it trained)
+        self.register_buffer('saved_tensor', None)
+        # Register a parameter for the gradient to be tracked
+        self.register_parameter('saved_grad', nn.Parameter(torch.zeros(1), requires_grad=True))
+        
+    def forward(self, x):
+        # For ManifoldTensor, we need to work with the underlying tensor
+        if isinstance(x, ManifoldTensor):
+            tensor = x.tensor
+        else:
+            tensor = x
+            
+        # Save the tensor for later access
+        self.saved_tensor = tensor.detach()
+        
+        # Register a hook to capture gradients during backward pass
+        if tensor.requires_grad:
+            def hook(grad):
+                # Clone the gradient to our parameter
+                if self.saved_grad.shape != grad.shape:
+                    # Resize parameter if needed
+                    self.saved_grad = nn.Parameter(torch.zeros_like(grad), requires_grad=True)
+                    self.saved_grad.grad = grad.detach().clone()
+                else:
+                    # Just copy the data
+                    self.saved_grad.data.copy_(grad.detach())
+                    self.saved_grad.grad = grad.detach().clone()
+                return grad
+            
+            tensor.register_hook(hook)
+            
+        # Return the original input unchanged to maintain the computation graph
+        return x
 
 class HMultiheadAttention(Module):
     def __init__(
@@ -18,6 +55,7 @@ class HMultiheadAttention(Module):
         kdim: Optional[int] = None,
         vdim: Optional[int] = None,
         batch_first: bool = False,
+        attention_activation: str = "exp"
     ):
         super(HMultiheadAttention, self).__init__()
         self.embed_dim = embed_dim
@@ -26,6 +64,7 @@ class HMultiheadAttention(Module):
         self.kdim = kdim if kdim is not None else embed_dim
         self.vdim = vdim if vdim is not None else embed_dim
         self.batch_first = batch_first
+        self.attention_activation = attention_activation
 
         self.head_dim = embed_dim // num_heads
         assert (
@@ -49,6 +88,11 @@ class HMultiheadAttention(Module):
             manifold=manifold,
         )
 
+        # For logging purposes
+        self.similarities = torch.nn.ModuleList([IntermediateValueModule(f"similarities.{i}") for i in range(num_heads)])
+        self.weights = torch.nn.ModuleList([IntermediateValueModule(f"weights.{i}") for i in range(num_heads)])
+        self.aggregates = torch.nn.ModuleList([IntermediateValueModule(f"aggregates.{i}") for i in range(num_heads)])
+
     def forward(
         self,
         query: ManifoldTensor, # [B, L_t, D] if batch_first
@@ -71,28 +115,18 @@ class HMultiheadAttention(Module):
         split_k = proj_k.split(split_size_or_sections=self.head_dim, dim=-1)
         split_v = proj_v.split(split_size_or_sections=self.head_dim, dim=-1)
 
-        if any([s.tensor.isnan().any() for s in split_q]):
-            raise ValueError(f"NaNs in projected Qs: {split_q}")
-        if any([s.tensor.isnan().any() for s in split_k]):
-            raise ValueError(f"NaNs in projected Ks: {split_k}")
-        if any([s.tensor.isnan().any() for s in split_v]):
-            raise ValueError(f"NaNs in projected Vs: {split_v}")
-
         # Apply similarity function f and activation g to Qs and Ks to obtain weights (g(f(q, k)))
         similarities = [
-            self.manifold.attention_similarity(queries=q, keys=k) for q, k in zip(split_q, split_k)
+            s(self.manifold.attention_similarity(queries=q, keys=k)) for q, k, s in zip(split_q, split_k, self.similarities)
         ]
-        if any([s.isnan().any() for s in similarities]):
-            raise ValueError(f"NaNs in similarities: {similarities}")
+
         weights = [
-            self.manifold.attention_activation(s) for s in similarities
+            w(self.manifold.attention_activation(s, self.attention_activation)) for s, w in zip(similarities, self.weights)
         ]
-        if any([w.isnan().any() for w in weights]):
-            raise ValueError(f"NaNs in weights: {weights}")
 
         # Aggregate values with sequence-aware specialization of the centroid
         aggregates = [
-            self.manifold.attention_midpoint(x=v, w=w) for v, w in zip(split_v, weights)
+            a(self.manifold.attention_midpoint(x=v, w=w)) for v, w, a in zip(split_v, weights, self.aggregates)
         ]
 
         # Concatenate outputs
@@ -117,6 +151,7 @@ class HFullDimensionMultiHeadAttention(Module):
         vdim: Optional[int] = None,
         batch_first: bool = False,
         use_separate_kv_per_head: bool = False,
+        attention_activation: str = "exp"
     ):
         """ 
         Args:
@@ -137,6 +172,7 @@ class HFullDimensionMultiHeadAttention(Module):
         self.vdim = vdim if vdim is not None else embed_dim
         self.use_separate_kv_per_head = use_separate_kv_per_head
         self.batch_first = batch_first
+        self.attention_activation = attention_activation
 
         # Introduce a scaling factor to prevent gradients from becoming too small.
         self.scale_tau = nn.Parameter(torch.zeros(1))
@@ -182,7 +218,7 @@ class HFullDimensionMultiHeadAttention(Module):
             # The code of HNN++ has the following line for similarity calculation, which I tried to replicate:
             # x = - self.ball.dist_matmul(x, encoder_out[0]) / self.scale.exp()
             similarities = self.manifold.attention_similarity(queries=q_i, keys=k_i, tau=1/self.scale_tau.exp(), gamma=self.scale_gamma)
-            weights = self.manifold.attention_activation(similarities)
+            weights = self.manifold.attention_activation(similarities, self.attention_activation)
             output_i = self.manifold.attention_midpoint(v_i, weights)
             
             head_outputs.append(output_i)
