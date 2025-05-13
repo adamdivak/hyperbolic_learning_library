@@ -39,7 +39,18 @@ class RiemannianAdam(Optimizer):
         )
         super(RiemannianAdam, self).__init__(params=params, defaults=defaults)
 
-    def step(self) -> None:
+    def step(self, closure=None):
+        """Performs a single optimization step.
+
+        Args:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        # Not really useful here, but makes it compatible with optimizers in PyTorch, which in
+        # turn makes it possible to use this in e.g. Lightning
+        if closure is not None:
+            loss = closure()
         # TODO: refactor this and add some comments, because it's currently unreadable
         with no_grad():
             for group in self.param_groups:
@@ -145,3 +156,5 @@ class RiemannianAdam(Optimizer):
 
                         param.copy_(new_param)
                         exp_avg.copy_(exp_avg_new)
+        
+        return loss
