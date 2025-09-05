@@ -38,7 +38,12 @@ class RiemannianSGD(Optimizer):
 
         super(RiemannianSGD, self).__init__(params=params, defaults=defaults)
 
-    def step(self) -> None:
+    def step(self, closure=None) -> None:
+        loss = None
+        # Not really useful here, but makes it compatible with optimizers in PyTorch, which in
+        # turn makes it possible to use this in e.g. Lightning
+        if closure is not None:
+            loss = closure()
         with no_grad():
             for group in self.param_groups:
                 lr = group["lr"]
@@ -123,3 +128,4 @@ class RiemannianSGD(Optimizer):
                         else:
                             new_param = param - lr * grad
                             param.copy_(new_param)
+        return loss

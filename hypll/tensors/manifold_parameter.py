@@ -12,6 +12,15 @@ class ManifoldParameter(ManifoldTensor, Parameter):
     _allowed_methods = [
         torch._has_compatible_shallow_copy_type,  # Required for torch.nn.Parameter
         torch.Tensor.copy_,  # Required to load ManifoldParameters state dicts
+        torch.Tensor.numel,  # Required for hyperparameter logging
+        torch.Tensor.register_hook,  # Required by wandb logging
+        torch.Tensor.type,  # Required for torch.nn.Parameter.type
+        torch.Tensor.double,  # Required for torch.nn.Parameter.double
+        torch.Tensor.float,  # Required for torch.nn.Parameter.float
+        torch.Tensor.half,  # Required for torch.nn.Parameter.half
+        torch.Tensor.cpu,  # Required for torch.nn.Parameter.cpu
+        torch.Tensor.cuda,  # Required for torch.nn.Parameter.cuda
+        torch.Tensor.to,  # Required for torch.nn.Parameter.to
     ]
 
     def __new__(cls, data, manifold, man_dim, requires_grad=True):

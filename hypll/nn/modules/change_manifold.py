@@ -33,11 +33,13 @@ class ChangeManifold(Module):
 
         """
 
-        match (x.manifold, self.target_manifold):
+        # match (x.manifold, self.target_manifold):
             # TODO(Philipp, 05/23): Apply shortcuts where possible: For example,
             # case (PoincareBall(), PoincareBall()): ...
             #
             # By default resort to logmap + expmap at the origin.
-            case _:
-                tangent_tensor = x.manifold.logmap(None, x)
-                return self.target_manifold.expmap(tangent_tensor)
+        # case _:
+        # mod by Adam: remove match statement, as Snellius provides Python 3.9 by default, match was introduced in 3.10
+        # This doesn't do anything currently anyway..
+        tangent_tensor = x.manifold.logmap(None, x)
+        return self.target_manifold.expmap(tangent_tensor)
