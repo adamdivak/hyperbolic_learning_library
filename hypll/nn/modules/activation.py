@@ -1,8 +1,9 @@
 from torch.nn import Module, Parameter
 from torch.nn.functional import relu, leaky_relu, gelu
+from torch import zeros
 
 from hypll.manifolds import Manifold
-from hypll.tensors import ManifoldTensor
+from hypll.tensors import ManifoldTensor, TangentTensor
 from hypll.utils.layer_utils import check_if_manifolds_match, op_in_tangent_space
 from scipy.special import beta
 
@@ -52,11 +53,34 @@ class HGLU(Module):
     def __init__(self, manifold: Manifold):
         super().__init__()
         self.manifold = manifold
-        self.scale = Parameter(torch.zeros(1))
+        self.scale = Parameter(zeros(1))
 
-    def forward(self, x, dim=-1):
+    def forward(self, x, dim=None):
+        # If dim is not specified, use the manifold dimension
+        if dim is None:
+            dim = x.man_dim
+        
         channels = x.size(dim)
-        beta_n = beta(channels / 2, 1 / 2)
-        beta_ni = beta(channels / 4, 1 / 2)
-        xa, xb = (self.manifold.logmap0(x, dim=dim) * beta_ni / beta_n).chunk(2, dim=dim)
-        return self.manifold.expmap0(xa * (xb * (channels ** 0.5) * self.scale.exp()).sigmoid(), dim=dim)
+        
+        # Split the input tensor into two equal parts along the specified dimension
+        # This uses the manifold's split operation which handles the beta scaling internally
+        xa_tensor, xb_tensor = self.manifold.split(x, split_size_or_sections=[channels // 2, channels // 2], dim=dim)
+        
+        # Map xb to tangent space for applying sigmoid
+        xb_tangent = self.manifold.logmap(x=None, y=xb_tensor)
+        
+        # Apply sigmoid activation in tangent space with scaling
+        sigmoid_input = xb_tangent.tensor * (channels ** 0.5) * self.scale.exp()
+        activated = sigmoid_input.sigmoid()
+        
+        # Map xa to tangent space
+        xa_tangent = self.manifold.logmap(x=None, y=xa_tensor)
+        
+        # Element-wise multiplication in tangent space
+        result_tangent = xa_tangent.tensor * activated
+        
+        # Create a proper TangentTensor
+        result_tangent_tensor = TangentTensor(data=result_tangent, manifold=self.manifold, man_dim=dim)
+        
+        # Map back to the manifold
+        return self.manifold.expmap(result_tangent_tensor)
