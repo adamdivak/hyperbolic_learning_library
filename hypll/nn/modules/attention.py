@@ -9,15 +9,27 @@ from hypll.nn import HLinear
 from hypll.tensors import ManifoldTensor
 
 class IntermediateValueModule(nn.Module):
-    def __init__(self, name):
+    """ Module to save intermediate values for debugging and analysis
+    
+    Intermediate values are values within a Module, not an output of a Module.
+    These could not be easily saved by the usual hooks, so we use this module to save them.
+    This is used for values such as similarities, weights, aggregates within attention. """
+    def __init__(self, name, enabled=True):
         super().__init__()
         self.name = name
+        self.enabled = enabled
         # Register a buffer for the saved tensor (not a parameter since we don't want it trained)
         self.register_buffer('saved_tensor', None)
         # Register a parameter for the gradient to be tracked
         self.register_parameter('saved_grad', nn.Parameter(torch.zeros(1), requires_grad=True))
+        # Store the hook handle to remove it later
+        self.hook_handle = None
         
     def forward(self, x):
+        # If not enabled (either locally or globally), just pass through without doing anything
+        if not self.enabled:
+            return x
+            
         # For ManifoldTensor, we need to work with the underlying tensor
         if isinstance(x, ManifoldTensor):
             tensor = x.tensor
@@ -26,6 +38,11 @@ class IntermediateValueModule(nn.Module):
             
         # Save the tensor for later access
         self.saved_tensor = tensor.detach()
+        
+        # Remove previous hook if it exists
+        if self.hook_handle is not None:
+            self.hook_handle.remove()
+            self.hook_handle = None
         
         # Register a hook to capture gradients during backward pass
         if tensor.requires_grad:
@@ -41,12 +58,41 @@ class IntermediateValueModule(nn.Module):
                     self.saved_grad.grad = grad.detach().clone()
                 return grad
             
-            tensor.register_hook(hook)
+            self.hook_handle = tensor.register_hook(hook)
             
         # Return the original input unchanged to maintain the computation graph
         return x
+        
+    # This is the key method to handle checkpoint loading properly
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """Custom state dict loading to handle the dynamic saved_grad and saved_tensor.
+        
+        This method resizes saved_grad to match the size in the checkpoint before loading,
+        which avoids size mismatch errors.
+        """
+        saved_tensor_key = prefix + 'saved_tensor'
+        saved_grad_key = prefix + 'saved_grad'
+        
+        # Handle saved_grad - resize it to match the checkpoint if needed
+        if saved_grad_key in state_dict:
+            checkpoint_grad = state_dict[saved_grad_key]
+            if self.saved_grad.shape != checkpoint_grad.shape:
+                # Resize parameter to match checkpoint size
+                self.saved_grad = nn.Parameter(torch.zeros_like(checkpoint_grad), requires_grad=True)
+        
+        # Handle saved_tensor - it's a buffer so we can just set it directly
+        if saved_tensor_key in state_dict:
+            checkpoint_tensor = state_dict[saved_tensor_key]
+            if checkpoint_tensor is not None:
+                self.saved_tensor = checkpoint_tensor.clone() if checkpoint_tensor is not None else None
+                
+        # Call the parent method with the original state dict
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                     missing_keys, unexpected_keys, error_msgs)
 
 class HMultiheadAttention(Module):
+    """ Multihead attention module for hyperbolic manifolds, using intermediate value modules for debugging """
     def __init__(
         self,
         embed_dim: int,
@@ -55,9 +101,13 @@ class HMultiheadAttention(Module):
         kdim: Optional[int] = None,
         vdim: Optional[int] = None,
         batch_first: bool = False,
-        attention_activation: str = "exp"
+        attention_activation: str = "exp",
+        causal: bool = True,
+        save_intermediate_values: bool = False,
+        use_attention_projection: bool = False,
+        mlp_init_scale: float = 1.0,
     ):
-        super(HMultiheadAttention, self).__init__()
+        super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.manifold = manifold
@@ -65,6 +115,10 @@ class HMultiheadAttention(Module):
         self.vdim = vdim if vdim is not None else embed_dim
         self.batch_first = batch_first
         self.attention_activation = attention_activation
+        self.causal = causal
+        self.save_intermediate_values = save_intermediate_values
+        self.use_attention_projection = use_attention_projection
+        self.mlp_init_scale = mlp_init_scale
 
         self.head_dim = embed_dim // num_heads
         assert (
@@ -88,11 +142,23 @@ class HMultiheadAttention(Module):
             manifold=manifold,
         )
 
-        # For logging purposes
-        self.similarities = torch.nn.ModuleList([IntermediateValueModule(f"similarities.{i}") for i in range(num_heads)])
-        self.weights = torch.nn.ModuleList([IntermediateValueModule(f"weights.{i}") for i in range(num_heads)])
-        self.aggregates = torch.nn.ModuleList([IntermediateValueModule(f"aggregates.{i}") for i in range(num_heads)])
+        # Introduce a scaling factor to replicate HNN++
+        self.scale_tau = nn.Parameter(torch.zeros(1))
+        self.scale_gamma = nn.Parameter(torch.zeros(1))
 
+        # For logging purposes - save intermediate values within the attention calculation
+        self.similarities = torch.nn.ModuleList([IntermediateValueModule(f"similarities.{i}", enabled=self.save_intermediate_values) for i in range(num_heads)])
+        self.weights = torch.nn.ModuleList([IntermediateValueModule(f"weights.{i}", enabled=self.save_intermediate_values) for i in range(num_heads)])
+        self.aggregates = torch.nn.ModuleList([IntermediateValueModule(f"aggregates.{i}", enabled=self.save_intermediate_values) for i in range(num_heads)])
+
+        if self.use_attention_projection:
+            self.attention_projection = HLinear(
+                in_features=embed_dim,
+                out_features=embed_dim,
+                manifold=manifold,
+                init_scale=self.mlp_init_scale,
+            )
+        
     def forward(
         self,
         query: ManifoldTensor, # [B, L_t, D] if batch_first
@@ -116,9 +182,26 @@ class HMultiheadAttention(Module):
         split_v = proj_v.split(split_size_or_sections=self.head_dim, dim=-1)
 
         # Apply similarity function f and activation g to Qs and Ks to obtain weights (g(f(q, k)))
-        similarities = [
-            s(self.manifold.attention_similarity(queries=q, keys=k)) for q, k, s in zip(split_q, split_k, self.similarities)
-        ]
+        # The code of HNN++ has the following line for similarity calculation, which I tried to replicate:
+        # x = - self.ball.dist_matmul(x, encoder_out[0]) / self.scale.exp()
+        similarities = []
+        for q, k, s in zip(split_q, split_k, self.similarities):
+            # Calculate similarity scores
+            sim = self.manifold.attention_similarity(queries=q, keys=k, tau=1/self.scale_tau.exp(), gamma=self.scale_gamma)
+            
+            # Apply causal mask if needed
+            if self.causal:
+                # Get sequence lengths
+                q_len, k_len = q.size(1), k.size(1)
+                
+                # Create causal mask: lower triangular matrix of ones, upper triangular of zeros
+                # This ensures each position can only attend to itself and previous positions
+                mask = torch.triu(torch.ones(q_len, k_len, device=sim.device), diagonal=1).bool()
+                
+                # Apply mask by setting masked positions to -inf (will become 0 after softmax)
+                sim = sim.masked_fill(mask, float('-inf'))
+            
+            similarities.append(s(sim))
 
         weights = [
             w(self.manifold.attention_activation(s, self.attention_activation)) for s, w in zip(similarities, self.weights)
@@ -141,111 +224,120 @@ class HMultiheadAttention(Module):
         else:
             return result
 
-
-class HFullDimensionMultiHeadAttention(Module):
-    def __init__(self,
+class HMultiheadAttentionOpt(Module):
+    """ Multihead attention module for hyperbolic manifolds, without the use of intermediate value modules """
+    def __init__(
+        self,
         embed_dim: int,
         num_heads: int,
         manifold: Manifold,
         kdim: Optional[int] = None,
         vdim: Optional[int] = None,
         batch_first: bool = False,
-        use_separate_kv_per_head: bool = False,
-        attention_activation: str = "exp"
+        attention_activation: str = "exp",
+        causal: bool = True,
+        use_attention_projection: bool = False,
+        mlp_init_scale: float = 1.0,
     ):
-        """ 
-        Args:
-            embed_dim: Dimension of the embedding space
-            num_heads: Number of attention heads
-            manifold: Manifold to use
-            kdim: Dimension of the key space
-            vdim: Dimension of the value space
-            batch_first: If True, the first dimension is the batch dimension
-            use_separate_kv_per_head: If True, use separate key and value for each head. 
-                If False then only the queries differ per head, which is Multi-Query Attention.
-        """
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.manifold = manifold
         self.kdim = kdim if kdim is not None else embed_dim
         self.vdim = vdim if vdim is not None else embed_dim
-        self.use_separate_kv_per_head = use_separate_kv_per_head
         self.batch_first = batch_first
         self.attention_activation = attention_activation
+        self.causal = causal
+        self.use_attention_projection = use_attention_projection
+        self.mlp_init_scale = mlp_init_scale
 
-        # Introduce a scaling factor to prevent gradients from becoming too small.
+        self.head_dim = embed_dim // num_heads
+        assert (
+            self.head_dim * num_heads == self.embed_dim,
+            "embed_dim must be divisible by num_heads"
+        )
+
+        self.q_map = HLinear(
+            in_features=embed_dim,
+            out_features=embed_dim,
+            manifold=manifold,
+        )
+        self.k_map = HLinear(
+            in_features=embed_dim,
+            out_features=embed_dim,
+            manifold=manifold,
+        )
+        self.v_map = HLinear(
+            in_features=embed_dim,
+            out_features=embed_dim,
+            manifold=manifold,
+        )
+
+        # Introduce a scaling factor to replicate HNN++
         self.scale_tau = nn.Parameter(torch.zeros(1))
         self.scale_gamma = nn.Parameter(torch.zeros(1))
 
-        # Create separate projection layers for each head
-        self.q_maps = nn.ModuleList([
-            HLinear(embed_dim, embed_dim, manifold=manifold) 
-            for _ in range(num_heads)
-        ])
-        if self.use_separate_kv_per_head:
-            self.k_maps = nn.ModuleList([
-                HLinear(embed_dim, embed_dim, manifold=manifold) 
-                for _ in range(num_heads)
-            ])
-            self.v_maps = nn.ModuleList([
-                HLinear(embed_dim, embed_dim, manifold=manifold) 
-                for _ in range(num_heads)
-            ])
-        else:
-            self.k_map = HLinear(embed_dim, embed_dim, manifold=manifold)
-            self.v_map = HLinear(embed_dim, embed_dim, manifold=manifold)
-
-        # For 2/a
-        self.output_projection = HLinear(embed_dim*num_heads, embed_dim, manifold=manifold)
-        # For 2/b
-        # self.output_projection = HLinear(num_heads, 1, manifold=manifold)
-        # self.output_projection = nn.Linear(num_heads, 1)
+        if self.use_attention_projection:
+            self.attention_projection = HLinear(
+                in_features=embed_dim,
+                out_features=embed_dim,
+                manifold=manifold,
+                init_scale=self.mlp_init_scale,
+            )
         
-    def forward(self, query, key, value, need_weights=False):
+    def forward(
+        self,
+        query: ManifoldTensor, # [B, L_t, D] if batch_first
+        key: ManifoldTensor, # [B, L_s, D] if batch_first
+        value: ManifoldTensor, # [B, L_s, D] if batch_first
+        need_weights: bool = False
+    ) -> Union[ManifoldTensor, Tuple[ManifoldTensor, List[torch.Tensor]]]:
         # Handle non-batch-first input
         if not self.batch_first:
             query, key, value = query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1)
-        
-        # Each head processes the full embedding
-        head_outputs = []
-        for i in range(self.num_heads):
-            q_i = self.q_maps[i](query)
-            k_i = self.k_maps[i](key) if self.use_separate_kv_per_head else self.k_map(key)
-            v_i = self.v_maps[i](value) if self.use_separate_kv_per_head else self.v_map(value)
-            
-            # Calculate attention (no splitting)
-            # The code of HNN++ has the following line for similarity calculation, which I tried to replicate:
-            # x = - self.ball.dist_matmul(x, encoder_out[0]) / self.scale.exp()
-            similarities = self.manifold.attention_similarity(queries=q_i, keys=k_i, tau=1/self.scale_tau.exp(), gamma=self.scale_gamma)
-            weights = self.manifold.attention_activation(similarities, self.attention_activation)
-            output_i = self.manifold.attention_midpoint(v_i, weights)
-            
-            head_outputs.append(output_i)
-        
-        # Combine outputs from different heads
-        # Option 1: Average in hyperbolic space
-        # This doesn't work now, need to figure out how to parameterize the midpoint calculation correctly
-        # result = self.manifold.attention_midpoint(x=head_outputs, w=[1/self.num_heads]*self.num_heads)
-        
-        # Option 2/a: Simply concat across the embed dim and map back to embed dim.
-        # This is simple, but it uses a concatenation along the manifold dimension, so it's quite expensive
-        # and results in beta scaling. I wanted to avoid this with 2/b, but that version didn't work, while this one does.
-        concat = self.manifold.cat(head_outputs, dim=-1)
-        result = self.output_projection(concat)
 
-        # Option 2/b: Project to higher dimension then back
-        # I thought this'd be theoretically more correct, but doesn't work at all
-        # I've tried it with HLinear layer, but that's obviously not correct, as it will always perform an operation
-        # along the manifold dimension, which is not the new final dimension we created. Also this last dimension
-        # does not contain points on the manifold.
-        # I've also tried it with a Euclidean linear layer, but that also didnt' work.
-        # head_outputs = [h.unsqueeze(-1) for h in head_outputs]
-        # concat = self.manifold.cat(head_outputs, dim=-1)
-        # result = self.output_projection(concat.tensor)
-        # result = result.squeeze(-1)
-        # result = ManifoldTensor(result, self.manifold)
-        
+        # Project Q, K and V with FC-layers ([B, L_s, D] -> [B, L_s, hd], with hd = D, so not really a projection)
+        proj_q = self.q_map(query)
+        proj_k = self.k_map(key)
+        proj_v = self.v_map(value)
+
+        # Split projected Q, K and V into seperate Q, K and V per head (Q: [B, L_t, hd] -> h * [B, L_t, d])
+        # Probably want to keep Qs as a tensor [h, B, L_t, d] to allow easy parallel compute
+        split_q = proj_q.split(split_size_or_sections=self.head_dim, dim=-1)
+        split_k = proj_k.split(split_size_or_sections=self.head_dim, dim=-1)
+        split_v = proj_v.split(split_size_or_sections=self.head_dim, dim=-1)
+
+        # Apply similarity function f and activation g to Qs and Ks to obtain weights (g(f(q, k)))
+        # The code of HNN++ has the following line for similarity calculation, which I tried to replicate:
+        # x = - self.ball.dist_matmul(x, encoder_out[0]) / self.scale.exp()
+        similarities = []
+        for q, k in zip(split_q, split_k):
+            # Calculate similarity scores
+            sim = self.manifold.attention_similarity(queries=q, keys=k, tau=1/self.scale_tau.exp(), gamma=self.scale_gamma)
+            
+            # Apply causal mask if needed
+            if self.causal:
+                # Get sequence lengths
+                q_len, k_len = q.size(1), k.size(1)
+                
+                # Create causal mask: lower triangular matrix of ones, upper triangular of zeros
+                # This ensures each position can only attend to itself and previous positions
+                mask = torch.triu(torch.ones(q_len, k_len, device=sim.device), diagonal=1).bool()
+                
+                # Apply mask by setting masked positions to -inf (will become 0 after softmax)
+                sim = sim.masked_fill(mask, float('-inf'))
+            
+            similarities.append(s(sim))
+
+        weights = [self.manifold.attention_activation(s, self.attention_activation) for s in similarities]
+
+        # Aggregate values with sequence-aware specialization of the centroid
+        aggregates = [self.manifold.attention_midpoint(x=v, w=w) for v, w in zip(split_v, weights)]
+
+        # Concatenate outputs
+        result = self.manifold.cat(aggregates, dim=-1)
+
+        # Handle non-batch-first output
         if not self.batch_first:
             result = result.transpose(0, 1)
 
