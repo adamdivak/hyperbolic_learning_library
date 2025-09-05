@@ -1,3 +1,7 @@
+# Note
+
+This is a fork of [HypLL](https://github.com/maxvanspengler/hyperbolic_learning_library), heavily modified to support some experiments for my thesis. The useful bits will be soon contributed back upstream, so you probably want to use the original repository.
+
 # Hyperbolic Learning Library
 
 [![Documentation Status](https://readthedocs.org/projects/hyperbolic-learning-library/badge/?version=latest)](https://hyperbolic-learning-library.readthedocs.io/en/latest/?badge=latest)
