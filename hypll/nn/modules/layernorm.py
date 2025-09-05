@@ -22,14 +22,14 @@ class HLayerNorm(Module):
                 dtype=None,
         ) -> None:
         
-        super(HLayerNorm, self).__init__()
+        super().__init__()
         self.normalized_shape = normalized_shape
         self.manifold = manifold
+        self.scale_by_d = scale_by_d
         self.euclidean_ln = LayerNorm(normalized_shape, 
             eps=eps,
             elementwise_affine=elementwise_affine,
             bias=bias,
-            scale_by_d=scale_by_d,
             device=device,
             dtype=dtype,
         )
