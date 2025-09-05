@@ -33,7 +33,7 @@ def poincare_hyperplane_dists(
     dim_shifted_x = x.movedim(source=dim, destination=-1)
 
     c_sqrt = c.sqrt()
-    lam = 2 / (1 - c * dim_shifted_x.pow(2).sum(dim=-1, keepdim=True))
+    lam = 2 / (1 - c * dim_shifted_x.pow(2).sum(dim=-1, keepdim=True)).clamp_min(1e-15)
     z_norm = z.norm(dim=0).clamp_min(1e-15)
 
     # Computation can be simplified if there is no offset
@@ -55,7 +55,7 @@ def poincare_hyperplane_dists(
                 - (lam - 1) * two_csqrt_r.sinh()
             )
         )
-
+    # assert torch.isfinite(dim_shifted_output).all(), "Inf/NaN detected in poincare_hyperplane_dists"
     return dim_shifted_output.movedim(source=-1, destination=dim)
 
 
@@ -87,5 +87,9 @@ def poincare_fully_connected(
     """
     c_sqrt = c.sqrt()
     x = poincare_hyperplane_dists(x=x, z=z, r=bias, c=c, dim=dim)
+    # assert torch.isfinite(x).all(), "Inf/NaN detected in poincare_fully_connected 1"
     x = (c_sqrt * x).sinh() / c_sqrt
-    return x / (1 + (1 + c * x.pow(2).sum(dim=dim, keepdim=True)).sqrt())
+    # assert torch.isfinite(x).all(), "Inf/NaN detected in poincare_fully_connected 2"
+    x = x / (1 + (1 + c * x.pow(2).sum(dim=dim, keepdim=True)).sqrt())
+    # assert torch.isfinite(x).all(), "Inf/NaN detected in poincare_fully_connected 3"
+    return x
