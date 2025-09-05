@@ -7,7 +7,7 @@ from torch import Tensor, empty, eye, no_grad
 from torch.nn import Parameter
 from torch.nn.common_types import _size_2_t
 from torch.nn.functional import softplus, unfold, softmax
-from torch.nn.init import normal_, zeros_
+from torch.nn.init import normal_, zeros_, kaiming_normal_, orthogonal_, xavier_normal_
 
 from hypll.manifolds.base import Manifold
 from hypll.manifolds.euclidean import Euclidean
@@ -62,7 +62,7 @@ class PoincareBall(Manifold):
             >>> manifold = Manifold(c=curvature)
 
         """
-        super(PoincareBall, self).__init__()
+        super().__init__()
         self.c = c
         self.cdist_type = cdist_type
 
@@ -234,8 +234,6 @@ class PoincareBall(Manifold):
         # s = w.size(1)  # Fixme check if this is the correct dim
         # result = self.mobius_scalar_mul(torch.FloatTensor([math.sqrt(s)]).to(x.tensor), result)
 
-        # HNN++ does a projection as well, not clear how much difference these make
-        # result = self.project(result)
         return result
 
     def frechet_variance(
@@ -274,17 +272,56 @@ class PoincareBall(Manifold):
 
         return weight, b
 
-    def reset_parameters(self, weight: ManifoldParameter, bias: Optional[Parameter]) -> None:
+    def reset_parameters(
+        self, 
+        weight: ManifoldParameter, 
+        bias: Optional[Parameter], 
+        init_type: str = 'normal',
+        scale: float = 1.0,
+        init_std: float = 0.01,
+    ) -> None:
         in_features, out_features = weight.size()
-        if in_features <= out_features:
+        if init_type == 'eye' and in_features <= out_features:
             with no_grad():
-                weight.tensor.copy_(1 / 2 * eye(in_features, out_features))
-        else:
+                weight.tensor.copy_(scale * 1 / 2 * eye(in_features, out_features))
+        elif init_type == 'normal':
             normal_(
                 weight.tensor,
                 mean=0,
-                std=(2 * in_features * out_features) ** -0.5,
+                std=scale * (2 * in_features * out_features) ** -0.5,
             )
+        elif init_type == 'orthogonal':
+            orthogonal_(weight.tensor.T, gain=scale)
+        elif init_type == 'xavier_normal':
+            # FIXME this is the same as normal, yet gives somewhat different results?
+            xavier_normal_(weight.tensor.T, gain=scale)
+        elif init_type == 'kaiming_normal':
+            # In HypLL the weights are stored transposed compared to PyTorch. In order to get the correct meaning
+            # for the fan_out/fan_in parameter, we need to transpose the weight tensor before passing to the 
+            # initialization function.
+            with no_grad():
+                kaiming_normal_(weight.tensor.T, mode='fan_out')
+                weight.tensor *= scale
+        elif init_type == 'direction_based':
+            with torch.no_grad():
+                # TransposeFix: use the transposed weight for direction
+                direction = torch.randn_like(weight.tensor)
+                # direction = torch.randn_like(weight.tensor.T) # num_embeddings, embedding_dim
+                direction /= direction.norm(dim=-1, keepdim=True).clamp_min(1e-7)
+                distance = torch.empty(weight.size(0), 1).normal_(std=init_std / self.c().sqrt())
+                
+                # self.weight.data.copy_(self.ball.expmap0(direction * distance))
+                # self.weight.data.copy_(direction * distance)
+
+                # TransposeFix: fix the man dim
+                # prod_tangent = TangentTensor(data=direction * distance, manifold=self, man_dim=1)
+                prod_tangent = TangentTensor(data=direction * distance, manifold=self, man_dim=0)
+                # TransposeFix: store the transpose of the final result as the weight
+                weight.data.copy_(self.expmap(prod_tangent).tensor)
+                # weight.data.copy_(self.expmap(prod_tangent).tensor.T)
+        else:
+            raise ValueError(f"Unknown init_type: {init_type}")
+
         if bias is not None:
             zeros_(bias)
 
@@ -380,14 +417,26 @@ class PoincareBall(Manifold):
         dim: int = 0,
     ) -> ManifoldTensor:
         check_if_man_dims_match(manifold_tensors)
+        if dim < 0:
+            dim = manifold_tensors[0].dim() + dim
+
         if dim == manifold_tensors[0].man_dim:
+            # Get device from the first tensor
+            device = manifold_tensors[0].tensor.device
+            
+            # Ensure all tensors are on the same device before applying logmap
             tangent_tensors = [self.logmap(None, t) for t in manifold_tensors]
-            ns = torch.tensor([t.shape[t.man_dim] for t in manifold_tensors])
+            
+            # Ensure ns tensor is on the same device as the manifold tensors
+            ns = torch.tensor([t.shape[t.man_dim] for t in manifold_tensors], device=device)
             n = ns.sum()
             beta_ns = beta_func(ns / 2, 0.5)
             beta_n = beta_func(n / 2, 0.5)
+            
+            # Ensure all tensors in the list comprehension are on the same device
             cat = torch.cat(
-                [(t.tensor * beta_n) / beta_n_i for (t, beta_n_i) in zip(tangent_tensors, beta_ns)],
+                [(t.tensor * beta_n.to(t.tensor.device)) / beta_n_i.to(t.tensor.device) 
+                 for (t, beta_n_i) in zip(tangent_tensors, beta_ns)],
                 dim=dim,
             )
             new_tensor = TangentTensor(data=cat, manifold=self, man_dim=dim)
@@ -403,6 +452,9 @@ class PoincareBall(Manifold):
         split_size_or_sections: Union[int, list[int]],
         dim: int = 0,
     ) -> list[ManifoldTensor]:
+        if dim < 0:
+            dim = manifold_tensor.dim() + dim
+
         # If we don't split along the man_dim we can use PyTorch's split
         if dim != manifold_tensor.man_dim:
             split_tensors = torch.split(
@@ -454,9 +506,11 @@ class PoincareBall(Manifold):
 
     def attention_activation(self, similarities: Tensor, activation: str = "exp") -> Tensor:
         if activation == "exp":
-            return similarities.exp()  # results in really large values in param_grad_norm
+            return similarities.exp()
         elif activation == "softmax":
-            return softmax(similarities, dim=-1)  # other option from FHNN++, not clear if it's better
+            return softmax(similarities, dim=-1)  # other option from HNN++, not clear if it's better
+        elif activation == "identity":
+            return similarities
         else:
             raise ValueError(f"Unknown activation: {activation}")
 
@@ -467,4 +521,3 @@ class PoincareBall(Manifold):
         # to the best of my understanding, c == k, but I wasn't entirely sure
         new_tensor = mobius_scalar_mul(r=r, x=x.tensor, k=self.c(), dim=dim)
         return ManifoldTensor(data=new_tensor, manifold=self, man_dim=dim)
-
